@@ -73,6 +73,73 @@ float pathVertical(float theta) {
     return PATH_VAMP * (sin(2.1 * theta) + 0.6 * sin(3.5 * theta + 0.7));
 }
 
+// Open quarter: last 90° of the torus ring (theta ∈ [-π/2, 0]) — camera exits here
+// and re-enters at theta=0. Smooth transitions of 0.3 rad (~17°) on each edge.
+float openGate(float theta) {
+    const float LO = -1.5708;  // -π/2
+    const float HI =  0.0;
+    const float T  =  0.3;
+    return smoothstep(LO, LO + T, theta) * (1.0 - smoothstep(HI - T, HI, theta));
+}
+
+// -----------------------------------------------------------------
+// Layered star field (adapted from Starlayer technique)
+// -----------------------------------------------------------------
+float hash21(vec2 p) {
+    vec2 pp = fract(p * vec2(132.423, 243.453));
+    pp += dot(pp, pp + 34.65);
+    return fract(pp.x * pp.y);
+}
+
+float starShape(vec2 uv, float flare) {
+    float d = length(uv);
+    float m = 0.015 / max(d, 0.001);                         // tighter glow — less halo
+    float rays = max(0.0, 1.0 - abs(uv.x * uv.y * 500.0));   // sharper cross rays
+    m += rays * flare;
+    vec2 uvr = vec2(uv.x - uv.y, uv.x + uv.y) * 0.7071;
+    rays = max(0.0, 1.0 - abs(uvr.x * uvr.y * 500.0));
+    m += rays * 0.4 * flare;
+    m *= smoothstep(0.45, 0.05, d);                           // cut off sooner — no ring edge
+    return m;
+}
+
+vec3 starLayer(vec2 uv) {
+    vec3 col = vec3(0.0);
+    vec2 gv = fract(uv) - 0.5;
+    vec2 id = floor(uv);
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 offs = vec2(float(x), float(y));
+            float n    = hash21(id + offs);
+            float size = fract(n * 345.3546);
+            float fl   = smoothstep(0.95, 1.0, size);
+            vec2  sp   = gv - offs - vec2(n, fract(n * 34.0)) + 0.5;
+            float star = starShape(sp, fl);
+            vec3 color = sin(6.2832 * vec3(0.3, 0.5, 0.6) * fract(n * 2345.45)) * 0.5 + 0.6;
+            star *= sin(time * 0.18 + n * 6.2832) * 0.25 + 0.75;  // slow drift-pulse
+            col += star * size * color * 0.2;
+        }
+    }
+    return col;
+}
+
+// Exterior space sky: layered parallax star field projected onto sphere
+vec3 spaceSky(vec3 rd) {
+    vec3 r = normalize(rd);
+    // Spherical UV so star positions are consistent by direction
+    vec2 sph = vec2(atan(r.z, r.x) * 0.3183, asin(clamp(r.y, -1.0, 1.0)) * 0.6366);
+    vec3 col = vec3(0.003, 0.001, 0.008);
+    // 6 layers with very slow drift — stars feel alive without obvious movement
+    for (float i = 0.0; i < 1.0; i += 0.1667) {
+        float depth = fract(i + time * 0.004);
+        float scale = mix(14.0, 3.5, depth);
+        float fade  = depth * smoothstep(1.0, 0.7, depth) * 0.9;
+        vec2  off   = vec2(i * 345.345, i * 178.432);
+        col += starLayer(sph * scale + off) * fade;
+    }
+    return col;
+}
+
 float sceneSDF(vec3 p) {
     vec3  tp    = torusFrame(p);
     float theta = atan(tp.z, tp.x);
@@ -237,58 +304,74 @@ vec3 tunnelLighting(vec3 pos, vec3 nor, vec3 rd, float crystMask) {
 // Render
 // -----------------------------------------------------------------
 vec3 render(vec3 ro, vec3 rd) {
+    // Camera gate — how far into the open section the camera currently is
+    vec3  cam_tp    = torusFrame(ro);
+    float cam_theta = atan(cam_tp.z, cam_tp.x);
+    float camGate   = openGate(cam_theta);
+
     float t = march(ro, rd);
 
     vec3 wallCol = vec3(0.0);
     if (t > 0.0) {
         vec3 pos = ro + t * rd;
-        vec3 nor = calcNormal(pos);
 
-        float distFade = exp(-0.018 * t);
-        float edgeMask = crystalSeam(pos) * distFade;
-        float crystMsk = crystalMask(pos) * distFade;
+        // Is this hit surface in the open section?
+        vec3  hit_tp    = torusFrame(pos);
+        float hit_theta = atan(hit_tp.z, hit_tp.x);
+        float hitGate   = openGate(hit_theta);
 
-        vec3 seamCol = vec3(0.42, 0.25, 0.55) * nor.x
-                     + vec3(0.40, 0.54, 0.12) * nor.y
-                     + vec3(0.84, 0.12, 0.86) * nor.z;
+        if (hitGate > 0.01) {
+            // Surface is in the open quarter — stars, dark at the rim boundary
+            vec3 sky = spaceSky(rd);
+            wallCol = sky * smoothstep(0.0, 0.35, hitGate);
+        } else {
+            // Normal tunnel shading
+            vec3 nor = calcNormal(pos);
 
-        vec3 col = seamCol * edgeMask * crystMsk;
-        col += seamCol * crystMsk * 0.30;
-        col += subsurfContrib(pos, max(edgeMask, 0.28) * crystMsk) * crystMsk;
+            float distFade = exp(-0.018 * t);
+            float edgeMask = crystalSeam(pos) * distFade;
+            float crystMsk = crystalMask(pos) * distFade;
 
+            vec3 seamCol = vec3(0.42, 0.25, 0.55) * nor.x
+                         + vec3(0.40, 0.54, 0.12) * nor.y
+                         + vec3(0.84, 0.12, 0.86) * nor.z;
 
-        // Normal-variation ambient — different wall faces get distinct hues for surface form
-        vec3 nAmb = vec3(0.040, 0.030, 0.060)
-                  + vec3(0.030, 0.018, 0.045) * abs(nor.x)
-                  + vec3(0.014, 0.022, 0.010) * abs(nor.y);
-        col += nAmb * (1.0 - crystMsk * 0.65);
+            vec3 col = seamCol * edgeMask * crystMsk;
+            col += seamCol * crystMsk * 0.30;
+            col += subsurfContrib(pos, max(edgeMask, 0.28) * crystMsk) * crystMsk;
 
-        // Camera headlamp — consistent fill so walls always show surface shape
-        vec3  eyeVec  = camPos - pos;
-        float eyeDist = length(eyeVec);
-        float eyeDiff = abs(dot(nor, eyeVec / eyeDist));
-        float eyeAtt  = 1.0 / (1.0 + eyeDist * eyeDist * 0.001);
-        col += vec3(0.07, 0.055, 0.10) * eyeDiff * eyeAtt * (1.0 - crystMsk * 0.4);
+            vec3 nAmb = vec3(0.040, 0.030, 0.060)
+                      + vec3(0.030, 0.018, 0.045) * abs(nor.x)
+                      + vec3(0.014, 0.022, 0.010) * abs(nor.y);
+            col += nAmb * (1.0 - crystMsk * 0.65);
 
-        col += tunnelLighting(pos, nor, rd, crystMsk);
+            vec3  eyeVec  = camPos - pos;
+            float eyeDist = length(eyeVec);
+            float eyeDiff = abs(dot(nor, eyeVec / eyeDist));
+            float eyeAtt  = 1.0 / (1.0 + eyeDist * eyeDist * 0.001);
+            col += vec3(0.07, 0.055, 0.10) * eyeDiff * eyeAtt * (1.0 - crystMsk * 0.4);
 
-        float fresnel = pow(1.0 - max(0.0, dot(nor, -rd)), 3.0);
-        col += seamCol * fresnel * crystMsk * 10.0;
+            col += tunnelLighting(pos, nor, rd, crystMsk);
 
-        vec3 reflDir = reflect(rd, nor);
-        vec3 reflEnv = vec3(0.42, 0.25, 0.55) * abs(reflDir.x)
-                     + vec3(0.40, 0.54, 0.12) * abs(reflDir.y)
-                     + vec3(0.84, 0.12, 0.86) * abs(reflDir.z);
-        float reflF = pow(1.0 - max(0.0, dot(nor, -rd)), 2.0);
-        col += reflEnv * reflF * crystMsk * 5.0;
+            float fresnel = pow(1.0 - max(0.0, dot(nor, -rd)), 3.0);
+            col += seamCol * fresnel * crystMsk * 10.0;
 
-        float fog = 1.0 - exp(-0.03 * t);
-        col = mix(col, vec3(0.01, 0.01, 0.02), fog);
-        col *= calculateAO(pos, nor);
+            vec3 reflDir = reflect(rd, nor);
+            vec3 reflEnv = vec3(0.42, 0.25, 0.55) * abs(reflDir.x)
+                         + vec3(0.40, 0.54, 0.12) * abs(reflDir.y)
+                         + vec3(0.84, 0.12, 0.86) * abs(reflDir.z);
+            float reflF = pow(1.0 - max(0.0, dot(nor, -rd)), 2.0);
+            col += reflEnv * reflF * crystMsk * 5.0;
 
-        wallCol = col;
+            float fog = 1.0 - exp(-0.021 * t);
+            col = mix(col, vec3(0.01, 0.01, 0.02), fog);
+            col *= calculateAO(pos, nor);
+
+            wallCol = col;
+        }
     } else {
-        wallCol = vec3(0.01, 0.01, 0.02);
+        // Missed ray — space sky when camera is in the open section
+        wallCol = mix(vec3(0.01, 0.01, 0.02), spaceSky(rd), camGate);
     }
 
     return wallCol;
