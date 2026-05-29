@@ -1,8 +1,8 @@
-// TorusTunnel — crystal surface style (Nimitz triangle-wave technique)
-// Fast: surfFunc uses only abs/fract, no trig or exp in SDF.
+// TorusTunnel — crystal surface (Nimitz triangle-wave technique)
 #version 330
 
 uniform float time;
+uniform float tunnelAngle;
 uniform vec2  resolution;
 uniform vec3  camPos;
 uniform vec3  camFwd;
@@ -15,14 +15,15 @@ layout (location = 0) out vec4 frag_out0;
 // -----------------------------------------------------------------
 // Torus parameters
 // -----------------------------------------------------------------
-const float R        = 18.0;   // ring radius — larger gives headroom for wide tube + path amp
-const float RH       =  15.0;   // radial tube half-extent  (floor/ceiling distance)
-const float RV       = 21.0;   // vertical tube half-extent (side-wall distance)
-const float PATH_AMP =  6.0;   // path radial oscillation amplitude
-const float PATH_FRQ =  1.0;   // sine waves per full revolution
+const float R         = 110.0;  // ring radius
+const float RH        =  39.0;  // radial tube half-extent
+const float RV        =  44.0;  // vertical tube half-extent
+const float PATH_AMP  =   6.0;  // radial path oscillation amplitude
+const float PATH_FRQ  =   1.0;  // radial waves per revolution — keep at 1 to avoid left/right chaos
+const float PATH_VAMP =   8.0;  // vertical path oscillation amplitude
 
 // -----------------------------------------------------------------
-// Crystal noise — triangle-wave (Nimitz technique, ~10 arithmetic ops)
+// Crystal noise — triangle-wave (Nimitz technique)
 // -----------------------------------------------------------------
 vec3 tri(in vec3 x) { return abs(x - floor(x) - 0.5); }
 
@@ -31,63 +32,67 @@ float surfFunc(in vec3 p) {
     return dot(tri(p * 0.5 + tri(p * 1.65 + 0.002*time).yzx), vec3(0.333));
 }
 
-// Asymmetric sine: slow rise (low slope), steep fall (high slope).
-// sin(x - 0.5*sin(x)) — derivative at x=0 is 0.5 (slow), at x=π is 1.5 (fast).
-float asymSin(float x) {
-    return sin(x - 0.5 * sin(x));
-}
+float asymSin(float x) { return sin(x - 0.5 * sin(x)); }
 
 // -----------------------------------------------------------------
 // Torus geometry
 // -----------------------------------------------------------------
-// half-period = π / (PATH_FRQ * OMEGA) = π / (1 * 0.055) ≈ 57 s per rise or fall
-const float OMEGA = 0.055;
+const float OMEGA = 0.025;
 
 vec3 torusFrame(vec3 p) {
-    float ang = -time * OMEGA;
+    float ang = -tunnelAngle;
     float c = cos(ang), s = sin(ang);
     return vec3(c*p.x + s*p.z, p.y, -s*p.x + c*p.z);
 }
 
-// Smooth ramp: like max(0, x) but with a rounded fillet of radius k at the base.
-// IQ polynomial form — C1 continuous, zero cost when x >> k.
+// Inverse of torusFrame — torus-local back to world
+vec3 torusToWorld(vec3 tp) {
+    float c = cos(tunnelAngle), s = sin(tunnelAngle);
+    return vec3(c*tp.x + s*tp.z, tp.y, -s*tp.x + c*tp.z);
+}
+
 float smax0(float x, float k) {
     float h = max(k - abs(x), 0.0) / k;
     return max(0.0, x) + h * h * k * 0.25;
 }
 
-// Shared bump so sceneSDF and crystalMask use identical nook weights.
 float wallBump(vec3 tp, vec2 q, float theta) {
-    float arc = theta * R;
+    float arc = theta * R * 0.5;  // halve all spatial freqs → bumps twice as large
+    float qx  = q.x  * 0.5;
+    float py  = tp.y * 0.5;
     float tm  = time * 0.003;
-    return sin(q.x * 0.31 + arc * 0.13 + tm)       * cos(tp.y * 0.24 + arc * 0.09 - tm * 0.7) * 0.60
-         + cos(q.x * 0.47 - arc * 0.21 + tm * 1.3) * sin(tp.y * 0.35 + tm * 0.5)              * 0.26
-         + sin(arc * 0.29 + tp.y * 0.17 + q.x * 0.19 - tm * 0.9)                              * 0.18
-         + cos(q.x * 0.68 + arc * 0.44 - tp.y * 0.31 + tm * 1.7)                              * 0.10;
+    return sin(qx * 0.31 + arc * 0.13 + tm)       * cos(py * 0.24 + arc * 0.09 - tm * 0.7) * 0.60
+         + cos(qx * 0.47 - arc * 0.21 + tm * 1.3) * sin(py * 0.35 + tm * 0.5)              * 0.26
+         + sin(arc * 0.29 + py * 0.17 + qx * 0.19 - tm * 0.9)                              * 0.18
+         + cos(qx * 0.68 + arc * 0.44 - py * 0.31 + tm * 1.7)                              * 0.10;
+}
+
+// Vertical path — independent frequencies from the radial path so up/down and left/right
+// are decoupled. Two incommensurate terms give non-repeating feel.
+float pathVertical(float theta) {
+    return PATH_VAMP * (sin(2.1 * theta) + 0.6 * sin(3.5 * theta + 0.7));
 }
 
 float sceneSDF(vec3 p) {
     vec3  tp    = torusFrame(p);
-    float theta = atan(tp.z, tp.x);                     // ring angle in torus frame
-    float rpath = R + PATH_AMP * asymSin(PATH_FRQ * theta); // displaced ring radius
+    float theta = atan(tp.z, tp.x);
+    float rpath = R + PATH_AMP * asymSin(PATH_FRQ * theta) + pathVertical(theta);
 
-    // q.x = deviation from displaced ring radius (camera vertical = radially outward)
-    // q.y = deviation in world Y (camera horizontal — tube is upright, Y is sideways)
     vec2  q    = vec2(length(tp.xz) - rpath, tp.y);
     float base = length(vec2(q.x / RH, q.y / RV)) - 1.0;
 
     float bump = wallBump(tp, q, theta);
-    base -= 0.3 * bump;
+    base -= 0.15 * bump;
 
-    // Rotate cc in the radial/ring plane so crystal noise axes aren't ring-aligned
     vec3  cc   = vec3(q.x, tp.y, theta * R);
-    const float cA = 0.9744, sA = 0.2250;  // cos/sin 13°
+    const float cA = 0.9744, sA = 0.2250;
     vec3  ccr  = vec3(cA*cc.x + sA*cc.z, cc.y, -sA*cc.x + cA*cc.z);
-    float sparse = surfFunc(ccr * vec3(0.4, 0.5, 0.36));
+    float sparse = surfFunc(ccr * vec3(0.14, 0.15, 0.136));
     float sf     = surfFunc(ccr * 0.2);
-    // Nook bias: bump>0 = concave nook (crystals favoured), bump<0 = convex (fewer)
-    float nookBias = clamp(0.7 + bump * 1.0, 0.05, 2.0);
-    float disp = smax0((0.15 + sparse * 0.40) - sf, 0.01) * 0.55 * nookBias;
+    float nookBias  = clamp(1.0 + bump * 1.0, 0.5, 2.0);
+    // Floor bias: crystals on inner wall (q.x=-RH) fade to zero above the midline
+    float floorBias = max(0.07, 1.0 - smoothstep(-RH * 0.5, RH * 0.35, q.x));
+    float disp = smax0((0.10 + sparse * 0.35) - sf, 0.01) * 0.25 * nookBias * floorBias;
 
     return base + disp;
 }
@@ -97,17 +102,17 @@ float sceneSDF(vec3 p) {
 // -----------------------------------------------------------------
 float march(vec3 ro, vec3 rd) {
     float t = 0.01;
-    for (int i = 0; i < 400; i++) {
+    for (int i = 0; i < 250; i++) {
         float d = sceneSDF(ro + t * rd);
         if (d > -0.001) return t;
-        t -= d;
-        if (t > 60.0) break;
+        t -= d*4.5;
+        if (t > 200.0) break;
     }
     return -1.0;
 }
 
 // -----------------------------------------------------------------
-// Normal and curvature (Nimitz discrete Laplacian)
+// Normal, AO, curvature
 // -----------------------------------------------------------------
 vec3 calcNormal(vec3 p) {
     const vec2 e = vec2(0.002, 0.0);
@@ -118,19 +123,15 @@ vec3 calcNormal(vec3 p) {
 }
 
 float calculateAO(vec3 p, vec3 n) {
-    // Inside-out: sceneSDF is negative in free space, so "free distance" = -sceneSDF.
-    // Occlusion = (expected free distance h) - (actual free distance): positive when
-    // a wall is closer than h.
     float occ = 0.0, sca = 1.0;
-    for (int i = 1; i <= 4; i++) {
-        float h = float(i) * 0.072;
-        float d = sceneSDF(p + n * h);      // negative in free tunnel space
-        occ += max(0.0, h + d) * sca;       // h - |d|: positive = nearby wall
+    for (int i = 1; i <= 6; i++) {
+        float h = float(i) * 0.092;
+        float d = sceneSDF(p + n * h);
+        occ += max(0.0, h + d) * sca;
         sca *= 0.1;
     }
     return clamp(1.0 - 3.0 * occ, 0.0, 1.0);
 }
-
 
 float curve(in vec3 p, in float w) {
     vec2 e = vec2(-1.0, 1.0) * w;
@@ -140,229 +141,157 @@ float curve(in vec3 p, in float w) {
 }
 
 // -----------------------------------------------------------------
-// Subsurface glow — lights drifting behind the crystal walls
+// Subsurface glow — 2D gaussian blobs drifting behind crystal walls
 // -----------------------------------------------------------------
 float ssGlow(vec2 uv, vec2 c, float r) {
     vec2 d = uv - c;
     return exp(-dot(d, d) / (r * r));
 }
 
-// edgeMask gates the glow: bright at crystal facet boundaries (thin crystal),
-// dim through flat faces — mimics light scattering through thin edges.
-vec3 subsurfContrib(vec3 pos, float edgeMask) {
-    vec3 tp    = torusFrame(pos);
-    float theta = atan(tp.z, tp.x);
-    vec2 uv    = vec2(theta * R, tp.y);
-
-    vec3 col = vec3(0.0);
-    col += vec3(0.50, 0.10, 1.00) * ssGlow(uv, vec2(sin(time*0.120)*40.0,                          sin(time*0.090)*5.0), 12.0);
-    col += vec3(1.00, 0.20, 0.50) * ssGlow(uv, vec2(cos(time*0.150)*42.0,                          sin(time*0.083)*5.5), 14.0);
-    col += vec3(0.30, 1.00, 0.40) * ssGlow(uv, vec2(sin(time*0.210)*30.0 + sin(time*0.070)*18.0,   cos(time*0.130)*4.0),  9.0);
-
-    return col * (edgeMask * 3.5 + 0.22);
-}
-
-// -----------------------------------------------------------------
-// Value-noise FBM for organic rock texture
-// -----------------------------------------------------------------
-float hash3(vec3 p) {
-    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453);
-}
-float valueNoise(vec3 p) {
-    vec3 i = floor(p), fr = fract(p);
-    vec3 u = fr * fr * (3.0 - 2.0 * fr);
-    float n000 = hash3(i),              n100 = hash3(i + vec3(1,0,0));
-    float n010 = hash3(i + vec3(0,1,0)), n110 = hash3(i + vec3(1,1,0));
-    float n001 = hash3(i + vec3(0,0,1)), n101 = hash3(i + vec3(1,0,1));
-    float n011 = hash3(i + vec3(0,1,1)), n111 = hash3(i + vec3(1,1,1));
-    return mix(mix(mix(n000,n100,u.x), mix(n010,n110,u.x), u.y),
-               mix(mix(n001,n101,u.x), mix(n011,n111,u.x), u.y), u.z);
-}
-float fbmRock(vec3 p) {
-    float v = 0.0, a = 0.5, total = 0.0;
-    for (int i = 0; i < 3; i++) {
-        v += a * valueNoise(p);
-        total += a;
-        p = p * 16.03 + vec3(113.3, 17.7, 114.9);
-        a *= 0.52;
-    }
-    return v / total;
-}
-
-// -----------------------------------------------------------------
-// Rock + rust — rough stone with iron-oxide water stains in smooth areas
-// -----------------------------------------------------------------
-vec3 rockRust(vec3 pos, vec3 nor, vec3 rd, float edgeMask) {
+vec3 subsurfContrib(vec3 pos, float gate) {
     vec3  tp    = torusFrame(pos);
     float theta = atan(tp.z, tp.x);
-    vec2  q     = vec2(length(tp.xz) - R, tp.y);
+    vec2  uv    = vec2(theta * R, tp.y);
 
-    // FBM grey-brown rock base — use rpath so radial coord is centred on tube axis
-    float rpath2 = R + PATH_AMP * asymSin(PATH_FRQ * theta);
-    vec2  qt     = vec2(length(tp.xz) - rpath2, tp.y);
-    vec3 rp = vec3(theta * R * 0.45, qt.x * 0.50, qt.y * 0.45);
-    float rock = clamp(fbmRock(rp) * 2.2 - 0.55, 0.0, 1.0);  // boost contrast
-    // Dark matte rock — noticeably more light-absorbing than crystals
-    vec3 rockCol = mix(vec3(0.05, 0.04, 0.03), vec3(0.22, 0.19, 0.14), rock);
+    vec3 col = vec3(0.0);
+    col += vec3(0.50, 0.10, 1.00) * ssGlow(uv, vec2(sin(time*0.120)*222.0,                          sin(time*0.090)*5.0), 67.0);
+    col += vec3(1.00, 0.20, 0.50) * ssGlow(uv, vec2(cos(time*0.150)*233.0,                          sin(time*0.083)*5.5), 78.0);
+    col += vec3(0.30, 1.00, 0.40) * ssGlow(uv, vec2(sin(time*0.210)*167.0 + sin(time*0.070)*100.0, cos(time*0.130)*4.0), 50.0);
 
-    // Rust/water stains: very small q.x scale → long vertical drips toward floor
-    vec3 sp = vec3(theta * R * 0.20, q.x * 0.038, q.y * 0.16);
-    float s1 = dot(tri(sp),                            vec3(0.333));
-    float s2 = dot(tri(sp * 1.3 + tri(sp * 0.9).yzx),  vec3(0.333));
-    float stain = s1 * 0.60 + s2 * 0.40;
-
-    // Stains concentrate near inner wall (floor = camera-down = smaller q.x)
-    stain *= 1.0 - 0.5 * smoothstep(-RH, RH * 0.3, q.x);
-    stain  = clamp(stain, 0.0, 1.0);
-
-    // Iron-oxide palette: kept dim relative to rock so wall stays matte
-    vec3 rustCol = mix(vec3(0.14, 0.06, 0.01), vec3(0.38, 0.16, 0.04), stain * stain);
-    vec3 col = mix(rockCol, rustCol, smoothstep(0.45, 0.65, stain));
-
-    // Wet rust sheen — subtle, rock stays non-reflective
-    float wetF = pow(1.0 - max(0.0, dot(nor, -rd)), 4.0);
-    col += vec3(0.40, 0.22, 0.05) * wetF * stain * stain * 1.0;
-
-    return col * (1.0 - edgeMask);
+    return col * (gate * 3.5 + 0.22);
 }
 
 // -----------------------------------------------------------------
-// Glowing orb — bug-like flight around/ahead of camera
+// Crystal mask
 // -----------------------------------------------------------------
-vec3 getOrbPos() {
-    float oy = cos(time*0.34)*1.5 + sin(time*0.57)*0.6;
-
-    // Raw forward + lateral — incommensurate so motion feels non-repeating
-    float fwd = sin(time*0.155)*9.0 + cos(time*0.095)*5.0 + sin(time*0.365)*2.0;
-    float lat = sin(time*0.415)*3.5 + cos(time*0.265)*1.5;
-
-    // Polar minimum-radius: when orb would cross through the camera it instead
-    // arcs to the side (near the wall), never cutting through the midpoint.
-    float r    = length(vec2(fwd, lat));
-    float minR = 5.0;
-    float sc   = r < minR ? minR / max(r, 0.01) : 1.0;
-
-    return camPos + camRight*(lat*sc) + camUp*oy + camFwd*(fwd*sc);
-}
-
-// -----------------------------------------------------------------
-// Orb sphere — analytical intersection + animated swirly surface
-// -----------------------------------------------------------------
-const float ORB_R = 0.7;
-
-float sphereIntersect(vec3 ro, vec3 rd, vec3 cen, float rad) {
-    vec3  oc = ro - cen;
-    float b  = dot(rd, oc);
-    float c  = dot(oc, oc) - rad * rad;
-    float h  = b * b - c;
-    if (h < 0.0) return -1.0;
-    return -b - sqrt(h);
-}
-
-// lp = unit vector on sphere surface (local normal direction)
-vec3 orbSurface(vec3 lp) {
-    vec3 q = lp * 2.5;
-    q += 0.50 * sin(q.yzx * 1.7 + time * 0.31);
-    q += 0.35 * sin(q.zxy * 2.3 - time * 0.27 + vec3(1.1, 2.2, 0.7));
-
-    float n1 = dot(tri(q * 0.8), vec3(0.333));
-    float n2 = dot(tri(q * 1.9 + tri(q * 1.3).yzx), vec3(0.333));
-    float n  = n1 * 0.55 + n2 * 0.45;
-
-    vec3 c1 = vec3(0.05, 0.00, 0.35);   // deep indigo
-    vec3 c2 = vec3(0.65, 0.10, 0.95);   // violet
-    vec3 c3 = vec3(0.15, 0.90, 1.00);   // cyan
-    return mix(c1, mix(c2, c3, n), n) * (0.7 + n * 2.2);
-}
-
-// Returns 1 wherever a crystal protrudes from the wall (re-evaluates the same
-// displacement noise as sceneSDF), 0 on bare rock.  Covers both the bright
-// facet edges AND the dark flat faces of each crystal.
 float crystalMask(vec3 pos) {
     vec3  tp     = torusFrame(pos);
     float theta  = atan(tp.z, tp.x);
-    float rpath  = R + PATH_AMP * asymSin(PATH_FRQ * theta);
+    float rpath  = R + PATH_AMP * asymSin(PATH_FRQ * theta) + pathVertical(theta);
     vec2  q      = vec2(length(tp.xz) - rpath, tp.y);
-    // Identical rotation as sceneSDF so mask aligns with actual crystal geometry
     vec3  cc     = vec3(q.x, tp.y, theta * R);
-    const float cA = 0.9744, sA = 0.2250;  // cos/sin 13°  // must match sceneSDF exactly
+    const float cA = 0.9744, sA = 0.2250;
     vec3  ccr    = vec3(cA*cc.x + sA*cc.z, cc.y, -sA*cc.x + cA*cc.z);
-    float sparse = surfFunc(ccr * vec3(0.4, 0.5, 0.36));
+    float sparse = surfFunc(ccr * vec3(0.4, 0.5, 0.16));
     float sf     = surfFunc(ccr * 0.2);
     float bump   = wallBump(tp, q, theta);
-    float nookBias = clamp(0.6 + bump * 1.0, 0.05, 2.0);
-    float disp   = smax0((0.15 + sparse * 0.40) - sf, 0.07) * 0.55 * nookBias;
-    return smoothstep(0.0, 0.12, disp);
+    float nookBias  = clamp(0.6 + bump * 1.0, 0.05, 2.0);
+    float floorBias = max(0.07, 1.0 - smoothstep(-RH * 0.5, RH * 0.35, q.x));
+    float disp   = smax0((0.10 + sparse * 0.35) - sf, 0.01) * 0.25 * nookBias * floorBias;
+    // Higher threshold so crystals must actually protrude before they get colored
+    return smoothstep(0.0001, 0.0012, disp*floorBias);
+}
+
+// Seam lines between crystal facets.  The tri-wave fold is at surfFunc = 0;
+// a narrow smoothstep there gives a crisp line on each facet boundary.
+float crystalSeam(vec3 pos) {
+    vec3  tp    = torusFrame(pos);
+    float theta = atan(tp.z, tp.x);
+    float rpath = R + PATH_AMP * asymSin(PATH_FRQ * theta) + pathVertical(theta);
+    vec2  q     = vec2(length(tp.xz) - rpath, tp.y);
+    vec3  cc    = vec3(q.x, tp.y, theta * R);
+    const float cA = 0.9744, sA = 0.2250;
+    vec3  ccr   = vec3(cA*cc.x + sA*cc.z, cc.y, -sA*cc.x + cA*cc.z);
+    float sf        = surfFunc(ccr * vec3(0.4, 0.5, 0.36));
+    float floorBias = max(0.07, 1.0 - smoothstep(-RH * 0.5, RH * 0.35, q.x));
+    // sf in [0, 0.5]; fold = 0.  Adjust 0.06 to change seam width.
+    return (1.0 - smoothstep(0.0, 0.16, sf)) * floorBias;
+}
+
+// -----------------------------------------------------------------
+// Tunnel point lights — 3 lights drifting along the path
+// -----------------------------------------------------------------
+vec3 tunnelLighting(vec3 pos, vec3 nor, vec3 rd, float crystMask) {
+    vec3 lc[3] = vec3[3](
+        vec3(0.9,  0.35, 1.0 ),   // purple
+        vec3(1.0,  0.25, 0.55),   // hot pink
+        vec3(0.25, 0.85, 1.0 )    // cyan
+    );
+    vec3 total = vec3(0.0);
+    for (int i = 0; i < 3; i++) {
+        float phase  = float(i) * 2.094;                       // 120° spacing
+        float spd    = 0.012 * (1.0 + float(i) * 0.5);
+        float thetaL = phase + time * spd;
+        float rpL    = R + PATH_AMP * asymSin(PATH_FRQ * thetaL) + pathVertical(thetaL);
+        float radW   = sin(time * 0.07 + phase) * 6.0;
+        float verW   = cos(time * 0.09 + phase) * 3.0;        // Y wander (left/right from camera)
+        vec3  tp     = vec3((rpL + radW) * cos(thetaL), verW, (rpL + radW) * sin(thetaL));
+        vec3  lpos   = torusToWorld(tp);
+
+        vec3  lvec   = lpos - pos;
+        float ldist  = length(lvec);
+        vec3  ldir   = lvec / ldist;
+        float att    = 1.0 / (1.0 + ldist * ldist * 0.0008);  // reach farther so walls get lit
+        float diff   = abs(dot(nor, ldir));
+        vec3  hVec   = normalize(-rd + ldir);
+        float spec   = pow(max(0.0, dot(nor, hVec)), 28.0);
+        // Neutral diffuse on bare rock so ceiling stays one color; colored only on crystals
+        vec3 wallDiff = vec3(0.45, 0.45, 0.55) * diff * 0.6;
+        total += (mix(wallDiff, lc[i] * diff * 1.0, crystMask)
+                 + lc[i] * spec * (0.1 + crystMask * 3.0)) * att;
+    }
+    return total;
 }
 
 // -----------------------------------------------------------------
 // Render
 // -----------------------------------------------------------------
 vec3 render(vec3 ro, vec3 rd) {
-    vec3  oPos   = getOrbPos();
-    const vec3 orbCol = vec3(0.85, 0.75, 1.0);
+    float t = march(ro, rd);
 
-    vec3  toOrb = oPos - ro;
-    float tc    = dot(toOrb, rd);
-    float d2    = max(0.0, dot(toOrb, toOrb) - tc * tc);
-
-    float tOrb = sphereIntersect(ro, rd, oPos, ORB_R);
-    float t    = march(ro, rd);
-
-    vec3  orbAccum = vec3(0.0);
-    // ORB DISABLED — re-enable halo + glow + sphere hit below to restore
-    // float orbT  = 1.0;
-    // float haloR = ORB_R * 3.8;
-    // if (d2 < haloR * haloR && tc > 0.001) { ... }
-    // if (tc > 0.001 && (t < 0.0 || tc < t))
-    //     orbAccum += orbCol * exp(-d2 * 0.25) * 1.25 * exp(-0.05 * tc);
-
-    // Wall shading — always evaluated so orb blend can show the wall through the edge.
     vec3 wallCol = vec3(0.0);
     if (t > 0.0) {
         vec3 pos = ro + t * rd;
         vec3 nor = calcNormal(pos);
 
-        float crv_fine  = abs(curve(pos, 0.02));
-        float edgeMask  = clamp(crv_fine * 7.0, 0.0, 1.0);
-        float crystMask = crystalMask(pos);
+        float distFade = exp(-0.018 * t);
+        float edgeMask = crystalSeam(pos) * distFade;
+        float crystMsk = crystalMask(pos) * distFade;
 
         vec3 seamCol = vec3(0.42, 0.25, 0.55) * nor.x
                      + vec3(0.40, 0.54, 0.12) * nor.y
                      + vec3(0.84, 0.12, 0.86) * nor.z;
-        vec3 col = seamCol * edgeMask;
 
-        col += subsurfContrib(pos, edgeMask);
-        col += rockRust(pos, nor, rd, crystMask);
+        vec3 col = seamCol * edgeMask * crystMsk;
+        col += seamCol * crystMsk * 0.30;
+        col += subsurfContrib(pos, max(edgeMask, 0.28) * crystMsk) * crystMsk;
+
+
+        // Normal-variation ambient — different wall faces get distinct hues for surface form
+        vec3 nAmb = vec3(0.040, 0.030, 0.060)
+                  + vec3(0.030, 0.018, 0.045) * abs(nor.x)
+                  + vec3(0.014, 0.022, 0.010) * abs(nor.y);
+        col += nAmb * (1.0 - crystMsk * 0.65);
+
+        // Camera headlamp — consistent fill so walls always show surface shape
+        vec3  eyeVec  = camPos - pos;
+        float eyeDist = length(eyeVec);
+        float eyeDiff = abs(dot(nor, eyeVec / eyeDist));
+        float eyeAtt  = 1.0 / (1.0 + eyeDist * eyeDist * 0.001);
+        col += vec3(0.07, 0.055, 0.10) * eyeDiff * eyeAtt * (1.0 - crystMsk * 0.4);
+
+        col += tunnelLighting(pos, nor, rd, crystMsk);
 
         float fresnel = pow(1.0 - max(0.0, dot(nor, -rd)), 3.0);
-        col += seamCol * fresnel * crystMask * 10.0;
+        col += seamCol * fresnel * crystMsk * 10.0;
 
         vec3 reflDir = reflect(rd, nor);
         vec3 reflEnv = vec3(0.42, 0.25, 0.55) * abs(reflDir.x)
                      + vec3(0.40, 0.54, 0.12) * abs(reflDir.y)
                      + vec3(0.84, 0.12, 0.86) * abs(reflDir.z);
         float reflF = pow(1.0 - max(0.0, dot(nor, -rd)), 2.0);
-        col += reflEnv * reflF * crystMask * 5.0;
+        col += reflEnv * reflF * crystMsk * 5.0;
 
-        float fog = 1.0 - exp(-0.14 * t);
-        col = mix(col, vec3(0.01, 0.01, 0.02), fog);  // dim blue-black fog, not pure black
+        float fog = 1.0 - exp(-0.03 * t);
+        col = mix(col, vec3(0.01, 0.01, 0.02), fog);
         col *= calculateAO(pos, nor);
 
-        float orbDist = length(ro - pos);
-        vec3  orbDir  = (ro - pos) / orbDist;
-        col += orbCol * abs(dot(nor, orbDir)) * 4.5 / (1.0 + orbDist * orbDist * 0.05);
-        vec3  hVec = normalize(-rd + orbDir);
-        float spec = pow(max(0.0, dot(nor, hVec)), 32.0);
-        col += orbCol * spec * crystMask * 3.5 / (1.0 + orbDist * orbDist * 0.04);
-
         wallCol = col;
+    } else {
+        wallCol = vec3(0.01, 0.01, 0.02);
     }
 
-    // ORB SPHERE HIT DISABLED
-    // if (tOrb > 0.001 && (t < 0.0 || tOrb < t)) { ... }
-
-    return wallCol + orbAccum;
+    return wallCol;
 }
 
 // -----------------------------------------------------------------

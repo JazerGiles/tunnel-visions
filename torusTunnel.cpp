@@ -19,12 +19,13 @@
 using namespace al;
 
 // Must match shader constants exactly
-static constexpr float OMEGA = 0.055f;  // torus rotation speed (rad/s)
-static constexpr float PATH_AMP = 6.0f; // path Y amplitude
-static constexpr float PATH_FRQ = 1.0f; // path waves per revolution
+static constexpr float OMEGA = 0.025f;    // torus rotation speed (rad/s)
+static constexpr float PATH_AMP = 6.0f;   // path radial amplitude
+static constexpr float PATH_FRQ = 1.0f;   // radial waves per revolution — must match shader
+static constexpr float PATH_VAMP = 8.0f;  // path vertical amplitude — must match shader
 
 // Slow-rise / steep-fall sine (same formula as shader)
-static float asymSin(float x)      { return std::sin(x - 0.5f * std::sin(x)); }
+static float asymSin(float x) { return std::sin(x - 0.5f * std::sin(x)); }
 static float asymSinDeriv(float x) { return std::cos(x - 0.5f * std::sin(x)) * (1.0f - 0.5f * std::cos(x)); }
 
 struct TorusTunnelApp : public App
@@ -34,6 +35,7 @@ struct TorusTunnelApp : public App
     SearchPaths searchPaths;
 
     double elapsedTime = 0.0;
+    double tunnelAngle = 0.0; // torus rotation phase, advances at variable rate
     double timeScale = 1.0;
     bool paused = false;
 
@@ -53,8 +55,8 @@ struct TorusTunnelApp : public App
 
         // R=12, camera 1.5 inside the ring radially; up = radially outward (+X at angle 0)
         // so inner wall is floor, outer wall is ceiling — same feel as original.
-        nav().pos(Vec3d(10.5, 0.0, 0.0));
-        nav().faceToward(Vec3d(10.5, 0.0, 1.0), Vec3d(1, 0, 0));
+        nav().pos(Vec3d(110.0, 0.0, 0.0));
+        nav().faceToward(Vec3d(110.0, 0.0, 1.0), Vec3d(1, 0, 0));
     }
 
     void onCreate() override
@@ -76,25 +78,39 @@ struct TorusTunnelApp : public App
             loadShader();
         }
         if (!paused)
+        {
             elapsedTime += dt * timeScale;
 
-        // Camera angle in torus frame advances at OMEGA rad/s.
-        // Path displaces RADIALLY: rpath = R + amp*asymSin(freq*beta).
-        // Camera tracks this so it stays centred in the tube. Radial = camera up/down.
-        const float camR0 = 16.0f - 1.5f; // base radial position (1.5 inside ring, R=16)
-        float beta = (float)elapsedTime * OMEGA;
-        float arg = PATH_FRQ * beta;
+            // Speed modulation: slow at the crest (sinVal≈+1), faster in the dip (sinVal≈-1).
+            // speedMod ∈ [0.7, 1.3] — adjust the 0.30 coefficient to taste.
+            float arg0 = PATH_FRQ * (float)tunnelAngle;
+            float sinVal0 = asymSin(arg0);
+            float speedMod = 1.0f - sinVal0 * 0.30f;
+            tunnelAngle += dt * timeScale * OMEGA * speedMod;
+        }
+
+        const float camR0 = 110.0f;
+        float arg = PATH_FRQ * (float)tunnelAngle;
         float sinVal = asymSin(arg);
         float dsindt = asymSinDeriv(arg) * PATH_FRQ * OMEGA;
-        float cam_r  = camR0 + PATH_AMP * sinVal;
+        float cam_r = camR0 + PATH_AMP * sinVal;
+
+        // Radial path oscillation — matches shader pathVertical(), applied to cam_r.
+        // Radial = camera up/down axis (outer wall is "up" in this tunnel).
+        auto pathRadial = [](float theta) -> float
+        {
+            return PATH_VAMP * (std::sin(2.1f * theta) + 0.6f * std::sin(3.5f * theta + 0.7f));
+        };
+        cam_r += pathRadial((float)tunnelAngle);
         nav().pos(Vec3d(cam_r, 0.0, 0.0));
 
-        // Tilt down only on descent (dsindt < 0), after passing the 0.7 threshold.
-        // Ramps in linearly: 0 at sinVal=0.7, full at sinVal=0.2.
         float descFrac = std::max(0.0f, std::min(1.0f, (0.7f - sinVal) / 0.5f));
         float tiltMask = (dsindt < 0.0f) ? descFrac : 0.0f;
-        float tiltR    = tiltMask * dsindt * PATH_AMP * 0.5f;
-        nav().faceToward(Vec3d(cam_r + tiltR, 0.0, 1.0), Vec3d(1, 0, 0));
+        float tiltR = tiltMask * dsindt * PATH_AMP * 0.5f;
+        // Look slightly ahead on radial path; Y stays 0 so camera never rolls.
+        float futAngle  = (float)tunnelAngle + 0.03f;
+        float futCamR   = camR0 + PATH_AMP * asymSin(PATH_FRQ * futAngle) + pathRadial(futAngle);
+        nav().faceToward(Vec3d(futCamR + tiltR, 0.0, 15.0), Vec3d(1, 0, 0));
     }
 
     void onDraw(Graphics &g) override
@@ -102,6 +118,7 @@ struct TorusTunnelApp : public App
         g.clear(0);
         shader.use();
         shader.uniform("time", (float)elapsedTime);
+        shader.uniform("tunnelAngle", (float)tunnelAngle);
         shader.uniform("resolution", Vec2f((float)width(), (float)height()));
 
         Vec3d p = nav().pos();
